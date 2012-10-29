@@ -18,79 +18,81 @@
  * limitations under the License.
  */
 
+#define _XOPEN_SOURCE 500
+
 #include <stdint.h>
 #include <stdio.h>
 #include <assert.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <string.h>
+#include <ucontext.h>
+
+#define EXNCALL_STACK_SIZE 65536
+
+void *current_stack;
 
 struct exn {
-	uint32_t oldesp;
-	uint32_t stklow;
-	uint32_t stksize;
-	void *stkp;	/* contains stksize bytes to be put back at stklow */
-	int rv;
-} __attribute__((packed));
+	ucontext_t saved_ctx;
+	void *saved_stack;
+	int jumped;
+};
+
+void *allocate_stack()
+{
+	void *stack = malloc(EXNCALL_STACK_SIZE);
+	memset(stack, 0xCC, EXNCALL_STACK_SIZE);
+	return stack;
+}
+
+void copy_stack(void *dest, void *src)
+{
+	memcpy(dest, src, EXNCALL_STACK_SIZE);
+}
 
 int exnset(struct exn *e, int rv)
 {
-	static int measured = 0;
-	static uint32_t stklow, stksize;
-	
-	if (!measured)
-	{
-		char buf[32];
-		int n;
-		FILE *fp;
-		uint32_t low, high;
-		char name[32];
-		char line[1024];
-		
-		n = snprintf(buf, 32, "/proc/%d/maps", getpid());
-		assert(n < 32);
-		fp = fopen(buf, "r");
-		if (!fp)
-			return -1;
-		while (fgets(line, 1024, fp) != NULL)
-			if (sscanf(line, "%lx-%lx %*s %*s %*s %*s %32s\n", &low, &high, name) != EOF)
-			{
-				if (!strcmp(name, "[stack]"))
-				{
-					measured = 1;
-					stklow = low;
-					stksize = high - low;
-					break;
-				}
-			}
-		fclose(fp);
-		if (!measured)
-		{
-			printf("WARNING: exnset could not find stack?\n");
-			return -1;
-		}
-	}
-	
-	e->stklow = stklow;
-	e->stksize = stksize;
-	e->stkp = malloc(stksize);
-	if (!e->stkp)
-		return -1;
-	e->rv = rv;
-	rv = __exnset(e);
-	return rv;
+	e->jumped = 0;
+	getcontext(&e->saved_ctx);
+
+	/* Are we returning after an exncall()? */
+	if (e->jumped)
+		return rv;
+
+	/* Allocate up a new stack and save our state there. */
+	e->saved_stack = allocate_stack();
+	copy_stack(e->saved_stack, current_stack);
+
+	e->jumped = 1;
+	return 0;
 }
 
-void exncall(struct exn *e) __attribute__ ((noreturn));
-extern void __exncall(struct exn *e) __attribute__ ((noreturn));
+ucontext_t stack_copy_context;
+char stack_copy_stack[EXNCALL_STACK_SIZE] __attribute__((aligned(16)));
 
-void exncall(struct exn *e)
+void __attribute__((noreturn)) exncall(struct exn *e)
 {
-	__exncall(e);
+	/* Swap to temporary stack to blast over our current one */
+	getcontext(&stack_copy_context);
+	stack_copy_context.uc_stack.ss_size = sizeof(stack_copy_stack);
+	stack_copy_context.uc_stack.ss_sp = stack_copy_stack;
+	stack_copy_context.uc_link = &e->saved_ctx;
+
+	/* Bounce over to the temporary stack, restore the stack that
+	 * exnset() saved, and then return to it */
+	makecontext(&stack_copy_context, (void(*)())copy_stack, 2,
+		current_stack, e->saved_stack);
+	setcontext(&stack_copy_context);
+
+	/* setcontext() should really be marked __attribute__((noreturn)),
+	 * but it isn't on some systems. */
+	assert(!"setcontext() returned?");
+	while(1);
 }
 
 void exnfree(struct exn *e)
 {
-	free(e->stkp);
+	free(e->saved_stack);
 }
 
 struct exn e;
@@ -116,7 +118,6 @@ static struct exn ambexn;
 
 void *amb(void **list)
 {
-	int rv = 0;
 	struct exn oldexn;
 	
 	memcpy(&oldexn, &ambexn, sizeof(struct exn));
@@ -153,7 +154,7 @@ void *l1[] = {(void*)1, (void*)2, (void*)3, (void*)4, NULL};
 void *l2[] = {(void*)4, (void*)5, (void*)3, (void*)4, NULL};
 void *l3[] = {(void*)6, (void*)7, (void*)8, (void*)9, NULL};
 
-int main()
+void test()
 {
 	int rv, r1, r2;
 	
@@ -170,9 +171,9 @@ int main()
 	printf(" - ambstart() returned %d\n", rv);
 	if (rv != 0)
 		return;
-	r1 = (int)amb(l1);
+	r1 = (int)(uintptr_t)amb(l1);
 	printf("   - amb(l1) returned %d\n", r1);
-	r2 = (int)amb(l2);
+	r2 = (int)(uintptr_t)amb(l2);
 	printf("     - amb(l2) returned %d\n", r2);
 	if (r1 != r2)
 	{
@@ -189,9 +190,9 @@ int main()
 		printf("amb search failed!\n");
 		return;
 	}
-	r1 = (int)amb(l2);
+	r1 = (int)(uintptr_t)amb(l2);
 	printf("   - amb(l2) returned %d\n", r1);
-	r2 = (int)amb(l3);
+	r2 = (int)(uintptr_t)amb(l3);
 	printf("     - amb(l3) returned %d\n", r2);
 	if (r1 != r2)
 	{
@@ -199,4 +200,20 @@ int main()
 		ambfail();
 	}
 	printf("found success! (TYPE A?)\n");
+}
+
+int main()
+{
+	ucontext_t main_ctx;
+	ucontext_t test_ctx;
+
+	getcontext(&test_ctx);
+	test_ctx.uc_stack.ss_size = EXNCALL_STACK_SIZE;
+	test_ctx.uc_stack.ss_sp = allocate_stack();
+	test_ctx.uc_link = &main_ctx;
+	makecontext(&test_ctx, test, 0);
+
+	current_stack = test_ctx.uc_stack.ss_sp;
+	swapcontext(&main_ctx, &test_ctx);
+	return 0;
 }
